@@ -1,0 +1,595 @@
+---
+title: "RSF modelis (vyresni vyrai + amžius ir hosp.)"
+author: "Domantas Gudas"
+date: "2026-04-26"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: readable
+---
+# Įvadas/kontekstas
+
+
+# Bibliotekos
+```{r, include=FALSE, echo=FALSE}
+library(dplyr)
+library(ranger)
+library(survival)
+library(survminer)
+library(caret)
+library(ggplot2)
+library(forcats)
+library(timeROC)
+library(riskRegression)
+library(pec)
+library(broom)
+library(knitr)
+library(kableExtra)
+library(tibble)
+```
+
+# Duomenų užsikrovimas
+```{r, include=FALSE, echo=FALSE}
+Final <- read.csv(
+  "C:/Users/domgud/Desktop/R/Bakalauras/Final.csv",
+  sep = ";"
+)
+
+age_median <- median(Final$AMZIUS2016PR, na.rm = TRUE)
+
+df <- Final %>%
+  filter(
+    AMZIUS2016PR > age_median,
+    ASM_LYTIS == "V"
+  )
+```
+
+# Duomenų paruošimas
+```{r, echo=FALSE}
+df_model <- df %>%
+  select(
+    -ASM_ID,
+    -contains("date"),
+    -starts_with("CV_death"),
+    -starts_with("MACCE"),
+    -starts_with("Heart_Failure")
+  ) %>%
+  mutate(
+    death = as.numeric(death),
+    death_FU = as.numeric(death_FU)
+  )
+```
+
+# Mokymo/testavimo aibės
+```{r, echo=FALSE}
+set.seed(1)
+train_idx <- createDataPartition(df_model$death, p = 0.7, list = FALSE)
+
+train_data <- df_model[train_idx, ]
+test_data  <- df_model[-train_idx, ]
+```
+
+# Modelio apmokymas
+```{r, echo=FALSE, warning=FALSE, message=FALSE, results='hide'}
+set.seed(1)
+rsf_model <- ranger(
+  Surv(death_FU, death) ~ .,
+  data = train_data,
+  num.trees = 200,
+  mtry = floor(sqrt(ncol(train_data) - 2)),
+  splitrule = "logrank",
+  importance = "permutation",
+  num.threads = max(1, parallel::detectCores() - 1)
+)
+```
+
+# Konkordacija
+```{r, echo=FALSE, warning=FALSE}
+set.seed(1)
+pred_test <- predict(rsf_model, data = test_data)
+
+test_data$risk_score <- 1 - pred_test$survival[, ncol(pred_test$survival)]
+
+c_index <- survConcordance(
+  Surv(death_FU, death) ~ risk_score,
+  data = test_data
+)
+
+c_val <- round(c_index$concordance, 3)
+
+data.frame(x = paste0("Concordance (C-Index) = ", c_val)) %>%
+  kable(format = "html", col.names = NULL) %>%
+  kable_styling(position = "center", full_width = FALSE) %>%
+  column_spec(1, bold = TRUE, color = "#2E86C1")
+```
+
+# Kintamųjų svarba
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+perm_imp <- data.frame(
+  Variable = names(rsf_model$variable.importance),
+  Importance = as.numeric(rsf_model$variable.importance)
+) %>%
+  arrange(desc(Importance))
+
+perm_imp %>%
+  slice(1:20) %>%
+  mutate(Variable = fct_reorder(Variable, Importance)) %>%
+  ggplot(aes(Variable, Importance)) +
+  geom_col(fill = "#4F81BD") +
+  coord_flip() +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Permutation Importance (Top 20)",
+    y = "Δ prediction accuracy",
+    x = ""
+  )
+
+TOP_N <- 10
+
+top_vars <- perm_imp %>%
+  filter(Importance > 0) %>%              
+  slice_head(n = TOP_N) %>%
+  pull(Variable)
+```
+
+# Kaplan-Meier
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+top5_vars <- perm_imp$Variable[1:10]
+
+for (var in top5_vars) {
+  
+  message("Processing: ", var)
+  
+  if (!var %in% names(test_data)) next
+  vals <- na.omit(test_data[[var]])
+  if (length(vals) == 0) next
+  unique_vals <- unique(vals)
+  if (length(unique_vals) < 2) next
+  
+  is_binary_cat <- is.factor(test_data[[var]]) || 
+                   is.character(test_data[[var]]) || 
+                   length(unique_vals) <= 2
+  
+  group_var <- var 
+  legend_labels <- NULL 
+  
+  if (is_binary_cat) {
+    test_data[[var]] <- as.factor(test_data[[var]])
+    legend_labels <- levels(test_data[[var]])
+    
+  } else {
+    cutp <- tryCatch(
+      surv_cutpoint(
+        data = test_data,
+        time = "death_FU",
+        event = "death",
+        variables = var,
+        minprop = 0.1
+      ),
+      error = function(e) return(NULL)
+    )
+    
+    if (is.null(cutp)) next
+    
+    cat_data <- tryCatch(surv_categorize(cutp), error = function(e) return(NULL))
+    if (is.null(cat_data)) next
+    
+    group_var <- paste0(var, "_grp")
+    test_data[[group_var]] <- cat_data[[var]]
+    legend_labels <- c("Low", "High")
+  }
+  
+  fml <- as.formula(paste("Surv(death_FU, death) ~", group_var))
+  
+  fit <- survfit(fml, data = test_data)
+  
+  fit$call$formula <- fml 
+  
+  pval_res <- survdiff(fml, data = test_data)
+  pval_val <- 1 - pchisq(pval_res$chisq, length(pval_res$n) - 1)
+  pval_txt <- tryCatch(format.pval(pval_val, digits = 3, eps = 0.001), error=function(e) "NA")
+
+  plot_title <- paste0("Survival by ", var)
+  if (!is_binary_cat) {
+    cp_val <- signif(cutp$cutpoint$cutpoint, 3)
+    plot_title <- paste0(plot_title, " (Cutpoint: ", cp_val, ")")
+  }
+  plot_title <- paste0(plot_title, "\nLog-rank p = ", pval_txt)
+
+  print(
+    ggsurvplot(
+      fit,
+      data = test_data,
+      pval = FALSE,
+      risk.table = TRUE,
+      conf.int = TRUE,
+      palette = if(length(legend_labels) > 2) "jco" else c("#2E86C1", "#E74C3C"),
+      title = plot_title,
+      legend.labs = legend_labels,
+      ggtheme = theme_minimal(),
+      tables.theme = theme_minimal()
+    )
+  )
+}
+```
+
+# KM grafikas pagal rizikos kvartilius
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+test_data <- test_data %>%
+  mutate(
+    risk_group = cut(
+      risk_score,
+      breaks = quantile(risk_score, probs = seq(0, 1, 0.25), na.rm = TRUE),
+      include.lowest = TRUE,
+      labels = c("Q1 (Low)", "Q2", "Q3", "Q4 (High)")
+    )
+  )
+
+fit_risk <- survfit(Surv(death_FU, death) ~ risk_group, data = test_data)
+
+fit_risk$call$formula <- Surv(death_FU, death) ~ risk_group
+pval_risk <- survdiff(
+  Surv(death_FU, death) ~ risk_group,
+  data = test_data
+)
+
+pval_txt <- signif(
+  1 - pchisq(pval_risk$chisq, length(pval_risk$n) - 1),
+  3
+)
+
+ggsurvplot(
+  fit_risk,
+  data = test_data,
+  pval = FALSE,
+  risk.table = TRUE,
+  palette = c("#1B9E77", "#D95F02", "#7570B3", "#E7298A"),
+  title = paste(
+    "Survival by Predicted Risk Quartiles (log-rank p =",
+    pval_txt, ")"
+  ),
+  ggtheme = theme_minimal(),
+  tables.theme = theme_minimal()
+)
+
+```
+
+# Nuo laiko priklausantys AUC
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+times_eval <- c(365, 730, 1095, 1459)
+
+roc_res <- timeROC(
+  T = test_data$death_FU,
+  delta = test_data$death,
+  marker = test_data$risk_score,
+  cause = 1,
+  weighting = "marginal",
+  times = times_eval,
+  iid = FALSE
+)
+
+plot_df <- data.frame()
+
+for (i in seq_along(times_eval)) {
+  auc_val <- round(roc_res$AUC[[i]], 3)
+  label <- paste0(round(times_eval[i]/365, 1), " Years (AUC = ", auc_val, ")")
+  
+  temp_df <- data.frame(
+    FP = roc_res$FP[, i],
+    TP = roc_res$TP[, i],
+    Timepoint = label, 
+    AUC = auc_val      
+  )
+  plot_df <- rbind(plot_df, temp_df)
+}
+
+auc_table <- data.frame(
+  `Follow-up Time` = c("1 Year", "2 Years", "3 Years", "4 Years"),
+  `Days` = times_eval,
+  `AUC Score` = round(roc_res$AUC, 3)
+)
+
+auc_table %>%
+  kable(
+    format = "html", 
+    col.names = c("Follow-up Interval", "Days", "Area Under the Curve (AUC)"),
+    caption = "Performance Summary: Time-Dependent Discrimination Power",
+    align = "lcc"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#2E86C1") %>% 
+  column_spec(3, bold = TRUE, color = "#2E86C1") %>% 
+  footnote(general = "AUC values represent the model's ability to distinguish between survivors and non-survivors at specific time points.")
+
+ggplot(plot_df, aes(x = FP, y = TP, color = Timepoint)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray60") +
+  geom_line(size = 1.2) +
+  scale_color_brewer(palette = "Dark2") + 
+  labs(
+    title = "Time-Dependent ROC Curves",
+    subtitle = "Prediction performance at 1, 2, 3, and 4 years",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Timepoint"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = c(0.7, 0.2), 
+    legend.background = element_rect(fill = "white", color = "gray90"),
+    plot.title = element_text(face = "bold", size = 14),
+    panel.grid.minor = element_blank()
+  )
+```
+
+# Kalibracijos grafikai (1-4 metai)
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=10, fig.height=8}
+library(riskRegression)
+library(ggplot2)
+library(dplyr)
+library(scales)
+
+times_eval <- c(365, 730, 1095, 1459)
+
+cal_all <- Score(
+  object = list("RSF" = rsf_model),
+  formula = Surv(death_FU, death) ~ 1,
+  data = test_data,
+  times = times_eval,
+  metrics = "Brier",
+  plots = "Calibration",
+  cens.method = "ipcw",
+  keep.matrix = TRUE
+)
+
+cal_df <- cal_all$Calibration$plotframe %>%
+  filter(model == "RSF", times %in% times_eval) %>%
+  mutate(time_label = paste0(round(times / 365, 1), " Year(s)"))
+
+cal_plot_df <- cal_df %>%
+  mutate(risk_group = ntile(risk, 10)) %>%
+  group_by(times, time_label, risk_group) %>%
+  summarise(
+    pred_risk = mean(risk, na.rm = TRUE),
+    obs_risk = sum(riskRegression_status * Wt) / sum(Wt),
+    .groups = "drop"
+  )
+
+ggplot(cal_plot_df, aes(x = pred_risk, y = obs_risk)) +
+  geom_point(color = "#E74C3C", size = 3) +
+  geom_line(color = "#2E86C1", size = 1.2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  facet_wrap(~time_label) +
+  scale_x_continuous(labels = percent_format(accuracy = 1), limits = c(0, NA)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(
+    title = "Calibration Plot for RSF Model",
+    subtitle = "Red points: mean risk per decile | Blue line: smoothed calibration",
+    x = "Predicted Risk",
+    y = "Observed Risk"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.background = element_rect(fill = "#F8F9F9", color = "gray90"),
+    strip.text = element_text(face = "bold", size = 11),
+    panel.grid.minor = element_blank(),
+    aspect.ratio = 1
+  )
+
+```
+
+# Standartinis Cox model
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+cox_vars <- intersect(top_vars, names(train_data))
+
+train_data[cox_vars] <- lapply(train_data[cox_vars], function(x) {
+  if (is.factor(x)) as.numeric(as.character(x))
+  else if (is.logical(x)) as.numeric(x)
+  else x
+})
+
+cox_formula <- as.formula(
+  paste("Surv(death_FU, death) ~", paste(cox_vars, collapse = " + "))
+)
+
+cox_model <- coxph(cox_formula, data = train_data)
+
+cox_results <- tidy(cox_model, exponentiate = TRUE, conf.int = TRUE) %>%
+  select(
+    Variable = term,
+    HR = estimate,
+    `95% CI Lower` = conf.low,
+    `95% CI Upper` = conf.high,
+    `p-value` = p.value
+  ) %>%
+  mutate(
+    across(c(HR, `95% CI Lower`, `95% CI Upper`), ~ round(., 2)),
+    `p-value` = case_when(
+      `p-value` < 0.001 ~ "< 0.001 ***",
+      `p-value` < 0.01  ~ paste0(round(`p-value`, 3), " **"),
+      `p-value` < 0.05  ~ paste0(round(`p-value`, 3), " *"),
+      TRUE ~ as.character(round(`p-value`, 3))
+    )
+  )
+
+cox_results %>%
+  kable(
+    format = "html", 
+    caption = "Multivariable Cox Proportional Hazards Regression Results",
+    align = "lcccc"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(2, bold = TRUE, color = "white", background = "#2E86C1") %>% 
+  add_header_above(c(" " = 1, "Effect Size" = 1, "Confidence Interval" = 2, "Significance" = 1)) %>%
+  footnote(general = "* p < 0.05, ** p < 0.01, *** p < 0.001. HR = Hazard Ratio.")
+```
+
+# Cox modelio prielaidos
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+cox_zph <- cox.zph(cox_model)
+
+zph_table <- as.data.frame(cox_zph$table) %>%
+  rownames_to_column("Variable") %>%
+  mutate(
+    Chi_Square = round(chisq, 3),
+    p_val = as.numeric(p),
+    `p-value` = ifelse(p < 0.001, "< 0.001", as.character(round(p, 3))),
+    Status = ifelse(
+      is.na(p_val), 
+      "—",
+      ifelse(p_val < 0.05, "✘ Fail (Violated)", "✔ Pass (Proportional)")
+    )
+  ) %>%
+  select(Variable, Chi_Square, `p-value`, Status)
+
+zph_table %>%
+  kable(
+    format = "html",
+    caption = "Schoenfeld Residuals Test for Proportional Hazards Assumption"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  column_spec(
+    4,
+    color = ifelse(zph_table$Status == "✔ Pass (Proportional)", "green", "red"),
+    bold = TRUE
+  )
+
+zph_logic <- as.data.frame(cox_zph$table) %>%
+  rownames_to_column("Variable") %>%
+  filter(Variable != "GLOBAL") %>%
+  mutate(p_val = as.numeric(p))
+
+tv_vars <- zph_logic %>%
+  filter(p_val < 0.05) %>%
+  pull(Variable)
+
+const_vars <- zph_logic %>%
+  filter(p_val >= 0.05) %>%
+  pull(Variable)
+
+```
+
+# Laiko priklausomi kintamieji (Time-Varying Effects)
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+
+
+
+cox_tv_formula <- as.formula(
+  paste(
+    "Surv(death_FU, death) ~",
+    paste(const_vars, collapse = " + "),
+    if (length(tv_vars) > 0)
+      paste("+", paste(paste0("tt(", tv_vars, ")"), collapse = " + "))
+  )
+)
+
+
+cox_tv <- coxph(
+  cox_tv_formula,
+  data = train_data,
+  tt = function(x, t, ...) x * log(t + 1)
+)
+
+
+tv_results <- tidy(cox_tv, conf.int = TRUE) %>%
+  mutate(
+    Effect_Type = ifelse(grepl("^tt\\(", term),
+                         "Time-varying (log(t+1))",
+                         "Constant"),
+    Variable = gsub("tt\\(|\\)", "", term),
+    Estimate = round(estimate, 3),
+    `Std. Error` = round(std.error, 3),
+    `z-statistic` = round(statistic, 2),
+    `p-value` = case_when(
+      p.value < 0.001 ~ "< 0.001 ***",
+      p.value < 0.01  ~ "< 0.01 **",
+      p.value < 0.05  ~ "< 0.05 *",
+      TRUE ~ as.character(round(p.value, 3))
+    )
+  ) %>%
+  select(Variable, Effect_Type, Estimate, `Std. Error`, `z-statistic`, `p-value`)
+
+
+tv_results <- tidy(cox_tv, conf.int = TRUE) %>%
+  mutate(
+    Effect_Type = ifelse(grepl("^tt\\(", term), 
+                         "Time-varying (log(t+1))", 
+                         "Constant"),
+    Variable = gsub("tt\\(|\\)", "", term),
+    
+    
+    
+    Display_Value = ifelse(Effect_Type == "Constant", 
+                           round(exp(estimate), 2), 
+                           round(estimate, 3)),
+    
+    
+    Conf_Low = ifelse(Effect_Type == "Constant", round(exp(conf.low), 2), round(conf.low, 3)),
+    Conf_High = ifelse(Effect_Type == "Constant", round(exp(conf.high), 2), round(conf.high, 3)),
+    
+    `p-value` = case_when(
+      p.value < 0.001 ~ "< 0.001 ***",
+      p.value < 0.01  ~ "< 0.01 **",
+      p.value < 0.05  ~ "< 0.05 *",
+      TRUE ~ as.character(round(p.value, 3))
+    )
+  ) %>%
+  
+  mutate(Result = ifelse(Effect_Type == "Constant",
+                         paste0(Display_Value, " (", Conf_Low, "-", Conf_High, ")"),
+                         as.character(Display_Value))) %>%
+  select(Variable, Effect_Type, Result, `p-value`)
+
+tv_results %>%
+  kable(
+    format = "html",
+    caption = "Final Clinical Model: Constant Hazard Ratios & Time-Varying Slopes",
+    col.names = c("Variable", "Effect Type", "HR (95% CI) or Slope", "Significance"),
+    align = "llcc"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  footnote(
+    general = "For 'Constant' variables, the value represents the Hazard Ratio. For 'Time-varying' variables, the value represents the interaction slope with log(time); positive values indicate risk increases over time."
+  )
+```
+
+# AFT
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+
+
+aft_formula <- as.formula(
+  paste("Surv(death_FU, death) ~", paste(cox_vars, collapse = " + "))
+)
+
+fit_weibull   <- survreg(aft_formula, data = train_data, dist = "weibull")
+fit_lognormal <- survreg(aft_formula, data = train_data, dist = "lognormal")
+
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+weibull_exp   <- exp(coef(fit_weibull))
+lognormal_exp <- exp(coef(fit_lognormal))
+
+exp_table <- data.frame(
+  Variable  = names(weibull_exp)[-1],
+  Weibull   = round(weibull_exp[-1], 3),
+  Lognormal = round(lognormal_exp[-1], 3)
+)
+
+
+kable(exp_table, caption = "Exponentiated AFT Model Coefficients (Weibull vs Lognormal)")
+```
+
+
