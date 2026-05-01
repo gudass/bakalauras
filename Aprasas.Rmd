@@ -1,0 +1,460 @@
+---
+title: "Aprašomoji_statistika"
+author: "Domantas Gudas"
+date: "2026-04-22"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: readable
+---
+
+# Užsikrauname bibliotekas
+
+```{r, echo=FALSE, warning = FALSE, message = FALSE}
+library(biostats)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(tidyr)
+library(gridExtra)
+```
+
+# Užsikrauname duomenis
+```{r, echo=FALSE, warning = FALSE, message = FALSE}
+df <- read_delim("~/Desktop/Bakalauras/Final.csv", 
+                 delim = ";", 
+                 locale = locale(encoding = "Windows-1257"))
+names(df)[names(df) == "˙ASM_ID"] <- "ASM_ID"
+
+```
+
+# Susitvarkome duomenis 
+```{r, echo=FALSE, warning =FALSE, message = FALSE}
+df <- df %>%
+  mutate(
+    ASM_ID = as.character(ASM_ID),
+    
+    ASM_LYTIS = factor(ASM_LYTIS),
+    
+    across(ends_with("_date"), ~ as.Date(.x, format = "%Y.%m.%d")),
+    
+    across(
+      c(
+        death, Cancer:Renal_Failure,
+        CV_death_primary,
+        CV_death_primary_AR_related,
+        CV_death_related,
+        MACCE1, MACCE2, MACCE3
+      ),
+      ~ factor(.x, levels = c(0, 1))
+    ),
+    
+    across(
+      c(
+        AMZIUS2016PR,
+        outpatient_I50_count,
+        inpatient_I50_count,
+        disease_count,
+        ends_with("_FU")
+      ),
+      as.numeric
+    )
+  )
+```
+Praleistų reikšmių pas mus nėra.
+```{r, echo=FALSE, message = FALSE, warning = FALSE}
+anyNA(df)
+```
+# Aprašomosios statistikos apibendrinimas
+```{r, echo=FALSE}
+summary_table(df, exclude = c('ASM_ID', 'death_date', 'CV_death_primary_date',
+                            'CV_death_primary_AR_date','CV_death_related_date',
+                              'MACCE1_date','MACCE2_date','MACCE3_date'))
+```
+Normalumo tikrinimą daro su shapiro wilk testu, o jis leidžia tik atlikti testą, kai imties dydis tarp 3 ir 5000. Todėl normalu, kad visos reikšmės gaunasi NA. Reikės tikrinti kvantilius.
+
+# Lytis
+```{r, echo=FALSE}
+sex_df <- df %>%
+  filter(!is.na(ASM_LYTIS)) %>%
+  count(ASM_LYTIS) %>%
+  mutate(
+    percent = n / sum(n) * 100,
+    label = paste0(ASM_LYTIS, "\n", round(percent, 1), "%")
+  )
+
+
+ggplot(sex_df, aes(x = "", y = n, fill = ASM_LYTIS)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(
+    aes(label = label),
+    position = position_stack(vjust = 0.5),
+    size = 4,
+    color = "white"
+  ) +
+  labs(
+    title = "Tiriamųjų pasiskirstymas pagal lytį",
+    fill = "Lytis"
+  ) +
+  theme_void(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "right"
+  )
+
+```
+
+# Amžius
+
+```{r, echo=FALSE}
+ggplot(df, aes(sample = AMZIUS2016PR)) +
+  stat_qq(color = "#2C3E50", alpha = 0.4) +
+  stat_qq_line(color = "#E74C3C", linewidth = 1) +
+  labs(
+    title = "Amžiaus kvantilių (QQ) grafikas",
+    subtitle = "Palyginimas su teoriniu normaliuoju skirstiniu",
+    x = "Teoriniai kvantiliai",
+    y = "Empiriniai kvantiliai"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+```{r, echo=FALSE}
+ggplot(df, aes(x = AMZIUS2016PR)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 50,
+    fill = "#3498DB",
+    color = "white",
+    alpha = 0.7
+  ) +
+  geom_density(
+    color = "#E74C3C",
+    linewidth = 1.2
+  ) +
+  labs(
+    title = "Amžiaus pasiskirstymas",
+    x = "Amžius",
+    y = "Tankis"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+```{r, echo=FALSE}
+ggplot(df, aes(x = AMZIUS2016PR)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 50,
+    fill = "#3498DB",
+    color = "white",
+    alpha = 0.6
+  ) +
+  geom_density(
+    color = "#2C3E50",
+    linewidth = 1.1
+  ) +
+  geom_vline(
+    aes(xintercept = mean(AMZIUS2016PR)),
+    color = "#E74C3C",
+    linewidth = 1,
+    linetype = "solid"
+  ) +
+  geom_vline(
+    aes(xintercept = median(AMZIUS2016PR)),
+    color = "#27AE60",
+    linewidth = 1,
+    linetype = "dashed"
+  ) +
+  facet_wrap(~ ASM_LYTIS) +
+  labs(
+    title = "Amžiaus pasiskirstymas pagal lytį",
+    subtitle = "Raudona linija – vidurkis, žalia punktyrinė – mediana",
+    x = "Amžius",
+    y = "Tankis"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+```{r, echo=FALSE}
+ggplot(df, aes(sample = AMZIUS2016PR)) +
+  stat_qq(alpha = 0.4, color = "#2C3E50") +
+  stat_qq_line(color = "#E74C3C", linewidth = 1) +
+  facet_wrap(~ ASM_LYTIS) +
+  labs(
+    title = "Amžiaus kvantilių grafikas pagal lytį",
+    x = "Teoriniai kvantiliai",
+    y = "Empiriniai kvantiliai"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+```{r, echo=FALSE}
+age_minmax <- df %>%
+  filter(!is.na(AMZIUS2016PR), !is.na(ASM_LYTIS)) %>%
+  group_by(ASM_LYTIS) %>%
+  summarise(
+    N = n(),
+    Min = min(AMZIUS2016PR),
+    Max = max(AMZIUS2016PR),
+    Mean = mean(AMZIUS2016PR),
+    Median = median(AMZIUS2016PR),
+    SD = sd(AMZIUS2016PR),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  age_minmax,
+  col.names = c("Lytis", "N", "Min amžius", "Max amžius", "Vidurkis", "Mediana", "SD"),
+  caption = "AMZIUS2016PR aprašomoji statistika pagal lytį",
+  digits = 1
+)
+
+```
+
+# Hospitalizacijos ir paslaugos
+```{r, echo=FALSE, warning=FALSE, message = FALSE}
+count_df <- df %>%
+  select(outpatient_I50_count, inpatient_I50_count) %>%
+  pivot_longer(cols = everything(), names_to = "Type", values_to = "Count")
+
+count_df <- count_df %>%
+  mutate(Vizitai = ifelse(Count > 0, "Vizitai", "Nėra vizitų"))
+
+zero_summary <- count_df %>%
+  group_by(Type, Vizitai) %>%
+  summarise(n = n()) %>%
+  mutate(percent = n / sum(n) * 100)
+
+ggplot(zero_summary, aes(x = Type, y = percent, fill = Vizitai)) +
+  geom_col(position = "stack") +
+  geom_text(aes(label = paste0(round(percent, 1), "%")), position = position_stack(vjust = 0.5), color = "white") +
+  labs(
+    title = "Pacientai su bent viena arba nei vienos hospitalizacijos dalis",
+    x = "",
+    y = "Procentas"
+  ) +
+  scale_fill_manual(values = c("Vizitai" = "#2ECC71", "Nėra vizitų" = "#E74C3C")) +
+  theme_minimal()
+
+```
+
+# Mirtys
+```{r, echo=FALSE}
+death_df <- df %>%
+  filter(!is.na(death)) %>%
+  mutate(
+    death_status = factor(death, levels = c(0,1), labels = c("Gyvas", "Miręs"))
+  ) %>%
+  count(death_status) %>%
+  mutate(
+    percent = n / sum(n) * 100,
+    label = paste0(death_status, "\n", round(percent, 1), "%")
+  )
+
+ggplot(death_df, aes(x = "", y = n, fill = death_status)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(
+    aes(label = label),
+    position = position_stack(vjust = 0.5),
+    size = 4,
+    color = "white"
+  ) +
+  scale_fill_manual(
+    values = c("Miręs" = "#B22222", "Gyvas" = "#2ECC71")
+  ) +
+  labs(
+    title = "Mirties atvejų pasiskirstymas",
+    fill = "Būsena"
+  ) +
+  theme_void(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "right"
+  )
+```
+
+```{r, echo=FALSE}
+# Vyrams
+male_df <- df %>%
+  filter(!is.na(death), ASM_LYTIS == "M") %>%
+  mutate(death_status = factor(death, levels = c(0,1), labels = c("Gyvas", "Miręs"))) %>%
+  count(death_status) %>%
+  mutate(
+    percent = n / sum(n) * 100,
+    label = paste0(death_status, "\n", round(percent,1), "%")
+  )
+
+# Moterims
+female_df <- df %>%
+  filter(!is.na(death), ASM_LYTIS == "V") %>%
+  mutate(death_status = factor(death, levels = c(0,1), labels = c("Gyvas", "Miręs"))) %>%
+  count(death_status) %>%
+  mutate(
+    percent = n / sum(n) * 100,
+    label = paste0(death_status, "\n", round(percent,1), "%")
+  )
+
+# Pie charts
+p_male <- ggplot(male_df, aes(x = "", y = n, fill = death_status)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = label), position = position_stack(vjust = 0.5),
+            size = 4, color = "white") +
+  scale_fill_manual(values = c("Gyvas" = "#2ECC71", "Miręs" = "#B22222")) +
+  labs(title = "Vyras", fill = "Būsena") +
+  theme_void(base_size = 13) +
+  theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"))
+
+p_female <- ggplot(female_df, aes(x = "", y = n, fill = death_status)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = label), position = position_stack(vjust = 0.5),
+            size = 4, color = "white") +
+  scale_fill_manual(values = c("Gyvas" = "#2ECC71", "Miręs" = "#B22222")) +
+  labs(title = "Moteris", fill = "Būsena") +
+  theme_void(base_size = 13) +
+  theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"))
+
+# Išdėstome šalia
+gridExtra::grid.arrange(p_male, p_female, ncol = 2)
+
+```
+# Ligos
+```{r, echo=FALSE, fig.width=9, fig.height=8}
+library(tidyverse)
+
+comorb_counts <- df %>%
+  summarise(across(everything(), ~sum(. == 1, na.rm = TRUE))) %>%
+  pivot_longer(cols = everything(), names_to = "Comorbidity", values_to = "Count")
+
+comorb_top20 <- comorb_counts %>%
+  filter(!Comorbidity %in% c(
+    "MACCE1", "MACCE2", "MACCE3", "death", 
+    "CV_death_primary", "CV_death_related", 
+    "CB_death_primary_AR_related", "CV_death_primary_AR_related",
+    "inpatient_I50_count", "outpatient_I50_count", "disease_count" 
+  )) %>%
+
+  mutate(Comorbidity = recode(Comorbidity,
+    "Hypertension" = "Arterinė hipertenzija",
+    "Ischemic_Heart_Disease" = "Išeminė širdies liga",
+    "Osteoarthritis" = "Osteoartritas",
+    "Back_Pain" = "Nugaros skausmas",
+    "Dyslipidemia" = "Dislipidemija",
+    "Diabetes" = "Cukrinis diabetas",
+    "COPD" = "LOPL",
+    "Stroke" = "Insultas",
+    "Cancer" = "Vėžys",
+    "Glaucoma" = "Glaukoma",
+    "Dementia" = "Demencija",
+    "Renal_Failure" = "Inkstų nepakankamumas",
+    "Osteoporosis" = "Osteoporozė",
+    "Hearing_Loss" = "Klausos sutrikimas",
+    "Obesity" = "Nutukimas",
+    "Anaemia" = "Anemija",
+    "Hypothyroidism" = "Hipotireozė",
+    "Atrial_Fibrillation" = "Prieširdžių virpėjimas",
+    "Asthma" = "Astma",
+    "Liver_Disease" = "Kepenų ligos",
+    "Gout" = "Podagra",
+    "Mental_Disorders" = "Psichologiniai_sutrikimai",
+    "Heart_Failure" = "Širdies nepakankamumas"
+  )) %>%
+  slice_max(order_by = Count, n = 20)
+
+ggplot(comorb_top20, aes(x = Count, y = reorder(Comorbidity, Count))) +
+  geom_col(fill = "steelblue", width = 0.7) +
+  geom_text(aes(label = format(Count, big.mark = " ")), 
+            hjust = -0.2, size = 3.5) + 
+  scale_x_continuous(expand = expansion(mult = c(0, 0.2)), 
+                     labels = scales::label_number(big.mark = " ")) +
+  labs(
+    title = "20 dažniausiai pasitaikančių diagnozių",
+    x = "Pacientų skaičius",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.y = element_text(size = 10, color = "black")
+  )
+```
+
+```{r, echo=FALSE, fig.width=12, fig.height=8}
+library(tidyverse)
+library(tidytext)
+
+comorb_sex_counts <- df %>%
+  group_by(ASM_LYTIS) %>%
+  summarise(across(everything(), ~sum(. == 1, na.rm = TRUE))) %>%
+  pivot_longer(cols = -ASM_LYTIS, names_to = "Comorbidity", values_to = "Count")
+
+top_comorbidities <- comorb_sex_counts %>%
+
+  filter(!Comorbidity %in% c(
+    "MACCE1", "MACCE2", "MACCE3", "death", 
+    "CV_death_primary", "CV_death_related", 
+    "CB_death_primary_AR_related", "CV_death_primary_AR_related",
+    "inpatient_I50_count", "outpatient_I50_count", "disease_count", "Heart_Failure"
+  )) %>%
+
+  mutate(Comorbidity = recode(Comorbidity,
+    "Hypertension" = "Arterinė hipertenzija",
+    "Ischemic_Heart_Disease" = "Išeminė širdies liga",
+    "Osteoarthritis" = "Osteoartritas",
+    "Back_Pain" = "Nugaros skausmas",
+    "Dyslipidemia" = "Dislipidemija",
+    "Diabetes" = "Cukrinis diabetas",
+    "COPD" = "LOPL",
+    "Stroke" = "Insultas",
+    "Cancer" = "Vėžys",
+    "Glaucoma" = "Glaukoma",
+    "Dementia" = "Demencija",
+    "Renal_Failure" = "Inkstų nepakankamumas",
+    "Osteoporosis" = "Osteoporozė",
+    "Hearing_Loss" = "Klausos sutrikimas",
+    "Obesity" = "Nutukimas",
+    "Anaemia" = "Anemija",
+    "Hypothyroidism" = "Hipotireozė",
+    "Atrial_Fibrillation" = "Prieširdžių virpėjimas",
+    "Asthma" = "Astma",
+    "Liver_Disease" = "Kepenų ligos",
+    "Gout" = "Podagra",
+    "Mental_Disorders" = "Psichologiniai sutrikimai"
+  )) %>%
+
+  group_by(ASM_LYTIS) %>%
+  slice_max(order_by = Count, n = 15, with_ties = FALSE) %>%
+  ungroup()
+
+
+ggplot(top_comorbidities, aes(x = Count, y = reorder_within(Comorbidity, Count, ASM_LYTIS), fill = as.factor(ASM_LYTIS))) +
+  geom_col(show.legend = FALSE) +
+  tidytext::scale_y_reordered() +
+  facet_wrap(~ASM_LYTIS, scales = "free_y") +
+  scale_fill_brewer(palette = "Set1") + 
+  geom_text(aes(label = format(Count, big.mark = " ")), 
+            hjust = -0.1, size = 4) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.4)), labels = scales::label_number(big.mark = " ")) +
+  labs(
+    title = "Pagrindinių diagnozių pasiskirstymas pagal lytį",
+    x = "Pacientų skaičius",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold", size = 16),
+    panel.spacing = unit(3, "lines"),
+    plot.title = element_text(face = "bold"),
+    axis.text.y = element_text(size = 11, color = "black")
+  )
+```
