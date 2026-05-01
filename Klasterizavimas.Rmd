@@ -1,0 +1,259 @@
+---
+title: "Klasterizavimas"
+author: "Domantas Gudas"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: readable
+    execute:
+      echo: false  
+      warning: false 
+      message: false 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 8)
+
+# ==========================================
+# 0. Bibliotekos
+# ==========================================
+library(tidyverse)
+library(cluster)
+library(factoextra)
+library(gridExtra)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+
+
+set.seed(123)
+```
+Šioje analizėje taikomas CLARA algoritmas, siekiant nustatyti pacientų klasterius pagal 30 lėtinių susirgimų ir jų derinius. Pagrindinis tikslas – nustatyti, kaip skirtingi ligų deriniai koreliuoja su pacientų mirtingumu, neatsižvelgiant vien tik į amžiaus faktorių. Elbow metodas pagrindė $K=8$ modelį. Tai leidžia detaliau segmentuoti populiaciją į specifines rizikos grupes.
+
+# Duomenų paruošimas
+```{r, echo = FALSE}
+Final <- read.csv(
+  "C:/Users/domgud/Desktop/R/Bakalauras/Final.csv",
+  sep = ";"
+)
+
+df <- Final %>%
+  mutate(
+    id = row_number(),
+    Sex_Male = ifelse(ASM_LYTIS == "M", 1, 0)
+  )
+
+disease_cols_for_clustering <- c(
+  "Cancer", "Anaemia", "Hypothyroidism", "Diabetes", "Obesity", 
+  "Dyslipidemia", "Dementia", "Mental_Disorders", "Parkinson", "Multiple_Sclerosis", 
+  "Epilepsy", "Sleep_Apnoea", "Back_Pain", "Glaucoma", "Blindness", "Hearing_Loss", 
+  "Hypertension", "Ischemic_Heart_Disease", "Stroke", "COPD", 
+  "Asthma", "IBD", "Psoriasis", "Rheumatoid_Arthritis", "Gout", "Osteoarthritis", 
+  "Lupus", "Osteoporosis", "Renal_Failure"
+)
+
+binary_df <- df %>%
+  select(id, all_of(disease_cols_for_clustering)) %>%
+  mutate(across(all_of(disease_cols_for_clustering), ~replace_na(., 0)))
+```
+
+# Optimalaus klasterių skaičiaus paieška
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+sample_size <- min(25000, nrow(binary_df))
+sample_for_plot <- binary_df %>%
+  slice_sample(n = sample_size) %>%
+  select(-id)
+
+wss <- fviz_nbclust(sample_for_plot, clara, method = "wss", k.max = 20) +
+  labs(title = "Optimalus K (Elbow metodas)")
+
+wss
+```
+
+Renkamės kiekį klasterių pagal alkūnės metodą, maždaug kur jau nustoja sparčiai žemėti tiesė grafike, aplink $K=8$.
+
+# Klasterizavimas (CLARA)
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+k_val <- 8  
+
+clara_res <- clara(
+  binary_df %>% select(-id),
+  k = k_val,
+  metric = "jaccard",
+  samples = 50,
+  pamLike = TRUE
+)
+
+df_results <- df %>%
+  filter(id %in% binary_df$id) %>%
+  mutate(cluster = factor(clara_res$clustering, levels = 1:k_val))
+```
+Suklasterizuojame.
+
+# Rezultatų analizė ir vizualizacija
+## Mirtingumo suvestinė
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+mortality_summary <- df_results %>%
+  group_by(cluster) %>%
+  summarise(
+    N = n(),
+    `Vyrų dalis (%)` = round(mean(Sex_Male, na.rm = TRUE) * 100, 1), 
+    `Amžiaus Mediana` = median(AMZIUS2016PR, na.rm = TRUE),
+    `Amžiaus Vidurkis` = round(mean(AMZIUS2016PR, na.rm = TRUE), 1),
+    Mirtys = sum(death, na.rm = TRUE),
+    `Mirtingumas (%)` = round(mean(death, na.rm = TRUE) * 100, 2),
+    .groups = "drop"
+  )
+
+formatted_cluster_table <- mortality_summary %>%
+  mutate(
+    Status = case_when(
+      `Mirtingumas (%)` > 30 ~ "⚠️ High Risk",
+      `Mirtingumas (%)` > 10 ~ "Moderate",
+      TRUE ~ "✅ Low Risk"
+    ),
+    `Mirtingumas (%)` = paste0(`Mirtingumas (%)`, " %")
+  )
+
+formatted_cluster_table %>%
+  kable(format = "html", escape = FALSE, align = "c",
+        caption = "<strong>Klasterių analizės suvestinė</strong>") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+  column_spec(6, bold = TRUE, color = "white", 
+              background = spec_color(mortality_summary$`Mirtingumas (%)`, option = "D", end = 0.7)) %>%
+  column_spec(7, bold = TRUE, 
+              color = case_when(
+                grepl("High", formatted_cluster_table$Status) ~ "red",
+                grepl("Moderate", formatted_cluster_table$Status) ~ "orange",
+                TRUE ~ "green"
+              )) %>%
+  row_spec(0, bold = TRUE, background = "beige")
+```
+1, 6 ir 7 klasteriai demonstruoja "kritinį" mirtingumą (>30%). Mirtingumas - ar žmogus mirė stebėtu laikotarpiu dėl bet kokios priežasties.
+
+Ypač išsiskiria 1-as klasteris, kuriame mirtingumas siekia net 56.2%. Atkreiptinas dėmesys, kad šios grupės amžiaus vidurkis (~80 m.) yra aukščiausias, todėl tai reprezentuoja vyresnio amžiaus pacientus.
+ 
+## Vizualus palyginimas: Mirtingumas vs Amžius
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+p_top <- ggplot(mortality_summary, aes(x = cluster, y = `Mirtingumas (%)`, fill = `Mirtingumas (%)`)) +
+  geom_col(color = "black", width = 0.7) +
+  scale_y_continuous(breaks = seq(0, 100, by = 10), expand = c(0, 0)) +
+  scale_fill_gradient(low = "#fee8c8", high = "#e34a33", name = "Mirt. %") +
+  theme_minimal() +
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank()) +
+  labs(y = "Mirt. %", title = "Klasterių demografinis ir rizikos profilis")
+
+p_mid <- ggplot(df_results, aes(x = cluster, y = AMZIUS2016PR, fill = cluster)) +
+  geom_violin(alpha = 0.6, trim = FALSE, show.legend = FALSE) +
+  stat_summary(fun = "median", geom = "point", color = "red", size = 2) + 
+  scale_fill_viridis_d(option = "mako", guide = "none") +
+  theme_minimal() +
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank()) +
+  labs(y = "Amžius")
+
+p_bot <- ggplot(df_results, aes(x = cluster, fill = factor(Sex_Male, labels = c("Moteris", "Vyras")))) +
+  geom_bar(position = "fill", color = "white", alpha = 0.8) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("Moteris" = "#f1a340", "Vyras" = "#998ec3"), name = "Lytis") +
+  theme_minimal() +
+  labs(x = "Klasteris", y = "Lyties %")
+
+combined_plot <- (p_top / p_mid / p_bot) + 
+  plot_layout(heights = c(1, 1, 0.8), guides = "collect")
+
+combined_plot
+```
+
+Smuiko grafiko „pilvas“ (plačiausia vieta) rodo, kur susikoncentravusi didžiausia dalis žmonių. Matome, kad pirmame klasteryje susikaupimas yra ties 80 metų riba. Siauros vietos nurodo, kad duomenų yra mažai.
+
+## Klasterių ligų profiliai (Heatmap)
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+cluster_profiles <- df_results %>%
+  group_by(cluster) %>%
+  summarise(across(all_of(disease_cols_for_clustering), ~mean(.x, na.rm = TRUE))) %>%
+  pivot_longer(cols = -cluster, names_to = "Liga", values_to = "Paplitimas")
+
+ggplot(cluster_profiles, aes(x = cluster, y = Liga, fill = Paplitimas)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "darkred") +
+  theme_minimal() +
+  labs(title = "Ligų paplitimas klasteriuose", 
+       subtitle = "Lytis į klasterizavimą neįtraukta",
+       x = "Klasteris", y = "Liga", fill = "Paplitimas")
+```
+
+Šilumos žemėlapyje galime pamatyti, koks yra klasterio profilis. Kuo raudonesnis langelis, tuo daugiau žmonių klasteryje, kurie turi tam tikrą ligą. Matome, kad visi klasteriai turi didelį žmonių kiekį su Ischemic Heart Disease ir Hypertension. 
+
+## Klasteriai
+### Pirmas klasteris
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+get_top_diseases <- function(cluster_num) {
+  cluster_profiles %>%
+    filter(cluster == cluster_num) %>%
+    arrange(desc(Paplitimas)) %>%
+    slice(1:10) %>%
+    mutate(Paplitimas = paste0(round(Paplitimas * 100, 1), " %")) %>%
+    rename(Liga = Liga, `Paplitimas Klasteryje` = Paplitimas)
+}
+
+get_top_diseases(1) %>%
+  kable(caption = "Top 10 ligų 1-ame klasteryje") %>%
+  kable_styling(bootstrap_options = "condensed", full_width = F)
+```
+
+### Antras klasteris
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+get_top_diseases(2) %>%
+  kable(caption = "Top 10 ligų 2-ame klasteryje") %>%
+  kable_styling(bootstrap_options = "condensed", full_width = F)
+```
+
+### Trečias klasteris
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+get_top_diseases(3) %>%
+  kable(caption = "Top 10 ligų 3-ame klasteryje") %>%
+  kable_styling(bootstrap_options = "condensed", full_width = F)
+```
+
+### Ketvirtas klasteris
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+get_top_diseases(4) %>%
+  kable(caption = "Top 10 ligų 4-ame klasteryje") %>%
+  kable_styling(bootstrap_options = "condensed", full_width = F)
+```
+
+### Penktas klasteris
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+get_top_diseases(5) %>%
+  kable(caption = "Top 10 ligų 5-ame klasteryje") %>%
+  kable_styling(bootstrap_options = "condensed", full_width = F)
+```
+
+### Šeštas klasteris
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+get_top_diseases(6) %>%
+  kable(caption = "Top 10 ligų 6-ame klasteryje") %>%
+  kable_styling(bootstrap_options = "condensed", full_width = F)
+```
+
+### Septintas klasteris
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+get_top_diseases(7) %>%
+  kable(caption = "Top 10 ligų 7-ame klasteryje") %>%
+  kable_styling(bootstrap_options = "condensed", full_width = F)
+```
+
+### Aštuntas klasteris
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+get_top_diseases(8) %>%
+  kable(caption = "Top 10 ligų 8-ame klasteryje") %>%
+  kable_styling(bootstrap_options = "condensed", full_width = F)
+```
+
+# Išvados
+Amžius nėra vienintelis prediktorius: Lyginant 6-ą klasterį su 2-u ar 3-u klasteriai, matome, kad specifinė diagnozių kombinacija (matoma Heatmap grafike) turi stipresnę vertę nei biologinis amžius, nes amžius yra panašus.
+
+Klinikinis pritaikymas: Identifikuoti ⚠️ High Risk klasteriai (1, 6, 7) turėtų būti prioritetinės grupės intensyviai stebėsenai ir prevencinėms intervencijoms.
