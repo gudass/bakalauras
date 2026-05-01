@@ -1,0 +1,636 @@
+---
+title: "Imtimi sumažintas atsitiktinių miškų modelis"
+author: "Domantas Gudas"
+date: "2026-05-05"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: readable
+---
+# Įvadas/kontekstas
+Pačioms pirmoms įžvalgoms gauti, mėgstu naudoti atsitiktinių miškų modelį, kuris nėra lengvai interpretuojamas, bet įdomu: 1. Pasižiūrėti ką matematika galvoja apie šiuos duomenis ir ar tai susiderina su realiu pasauliu. 2. Įgauti pradinę intuiciją duomenims, kaip jie atrodo ir kaip jie reaguoja vienas su kitais.
+
+Paruošėme duomenis prognozuoti mirtį (0 arba 1) pagal mūsų faktorius. Šiame darbe prognozuojama bendroji (visų priežasčių) mirtis, o ne kokia nors specifinė mirtis, pavyzdžiui, kardiovaskulinė mirtis. Padarėme mokymo/testavimo aibes (70/30 santykiu). Iš gautų 70 procentų duomenų skirtus modelio treniravimui, išmetėme tam tikrą kiekį duomenų, kad būtų vienodai mirusiųjų ir gyvųjų modeliui mokyti. Priežastys: 1. Didelis klasių disbalansas. Modelis išmoksta prognozuoti didesniąją klasę, iškreipia rezultatus 2. Galimi ir kiti metodai, bet geriausias modelis mano testavime buvo pasiektas su būtent duomenų išmetimu (Galima uždėti klasėms svorius, prigaminti netikrų duomenų ir t.t) 3. Išmetus duomenų skaičių, vis tiek turime 60k duomenų, kas yra per akis.
+
+Tada sudarome hiperparametrų gardelę ir ieškome pačių geriausių modelio kombinacijų. Geriausią modelį išsaugome, ir tada optimizuojame slenkstį. Slenkstis nusako, nuo kurio skaičiaus geriausia atskirti reikšmes (tarp 0 ir 1), kad klasifikuoti ar žmogus bus miręs, ar gyvas.
+
+Galų gale, iš anksčiau pasiimame testavimo aibę (30 proc. duomenų likusiųjų), kurie buvo visiškai neliesti ir nematyti jokio modelio ar kodo. Įvertiname, kaip gerai modelis klasifikuoja mirtį, pasižiūrime, kurie kintamieji padarė didžiausią įtaką.
+
+# Bibliotekos
+```{r, include=FALSE, echo=FALSE}
+library(dplyr)
+library(caret)
+library(ranger)
+library(pROC)
+library(knitr)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(scales)
+library(pROC)
+library(ggplot2)
+library(forcats)
+```
+
+# Duomenų užsikrovimas
+```{r, include=FALSE, echo=FALSE}
+Final <- read.csv(
+  "C:/Users/domgud/Desktop/R/Bakalauras/Final.csv",
+  sep = ";"
+)
+
+df <- Final
+```
+
+# Duomenų paruošimas
+```{r, echo=FALSE}
+df_model <- df %>%
+  select(
+    -ASM_ID,
+    -contains("date"),
+    -contains("_FU"),
+    -starts_with("CV_death"),
+    -starts_with("MACCE"),
+    -starts_with("Heart_Failure")
+  )
+
+df_model$death <- factor(df_model$death, levels = c(0, 1))
+```
+
+# Mokymo/testavimo aibės
+```{r, echo=FALSE}
+set.seed(1)
+
+train_idx <- createDataPartition(df_model$death, p = 0.7, list = FALSE)
+train_data <- df_model[train_idx, ]
+test_data  <- df_model[-train_idx, ]
+
+kable(
+  rbind(
+    Train = prop.table(table(train_data$death)),
+    Test  = prop.table(table(test_data$death))
+  ),
+  caption = "Baigties (mirties) paplitimas mokymo ir testavimo aibėse"
+)
+```
+
+# Mokymo aibės imties sumažinimas
+```{r, echo=FALSE}
+set.seed(1)
+
+train_down <- downSample(
+  x = train_data %>% select(-death),
+  y = train_data$death,
+  yname = "death"
+)
+
+kable(
+  prop.table(table(train_down$death)),
+  caption = "Baigties pasiskirstymas po imties sumažinimo"
+)
+```
+
+# Hiperparametrų tinklas
+```{r, echo=FALSE}
+n_cores <- max(1, parallel::detectCores() - 1)
+
+p <- ncol(train_down) - 1
+
+mtry_grid <- unique(pmax(1, c(
+  floor(sqrt(p)),
+  floor(p / 3),
+  floor(p / 2)
+)))
+
+trees_grid <- c(300, 500, 800)
+
+grid <- expand.grid(
+  mtry = mtry_grid,
+  num.trees = trees_grid,
+  AUC = NA_real_
+)
+```
+
+# Hiperparametrų optimizavimas
+```{r, echo=FALSE}
+set.seed(1)
+
+for (i in seq_len(nrow(grid))) {
+
+  rf_tmp <- ranger(
+    death ~ .,
+    data = train_down,
+    num.trees = grid$num.trees[i],
+    mtry = grid$mtry[i],
+    probability = TRUE,
+    importance = "none",
+    num.threads = n_cores,
+    seed = 1
+  )
+
+  pred_tmp <- predict(rf_tmp, data = train_down)$predictions[, "1"]
+
+  grid$AUC[i] <- as.numeric(
+    auc(roc(train_down$death, pred_tmp, quiet = TRUE))
+  )
+}
+
+grid <- grid[order(-grid$AUC), ]
+
+kable(
+  grid,
+  digits = 3,
+  caption = "Hiperparametrų optimizavimo rezultatai (AUC)"
+)
+```
+
+Optimizavome hiperparametrus pagal AUC. Šiuo atveju didelis AUC nieko nereiškia kaip rodiklis, jis mums bus svarbus tik tai tada, kai pritaikysime modelį ant testavimo aibės.
+
+Hiperparametrų optimizavimo tikslas – rasti tokį atsitiktinių miškų modelio sudėtingumo ir atsitiktinumo balansą, kuris geriausiai atskirtų pacientus pagal mirties riziką.
+
+Pastebėtina, kad skirtingoms hiperparametrų kombinacijoms gaunami labai panašūs AUC rezultatai. Tai rodo, kad:
+
+• modelis yra stabilus,
+• rezultatai nėra jautrūs konkrečiam parametrų pasirinkimui,
+• duomenyse egzistuoja stiprus signalas, kurį modelis aptinka nepriklausomai nuo smulkių parametrų pokyčių.
+
+Tai laikytina teigiamu požymiu, nes sumažina peroptimizavimo (overfitting) riziką.
+
+# Paskutinio modelio apmokymas
+```{r, echo=FALSE}
+best_mtry  <- grid$mtry[1]
+best_trees <- grid$num.trees[1]
+
+rf_final <- ranger(
+  death ~ .,
+  data = train_down,
+  num.trees = best_trees,
+  mtry = best_mtry,
+  probability = TRUE,
+  importance = "impurity",
+  num.threads = n_cores,
+  seed = 1
+)
+```
+
+# Slenksčio optimizavimas
+```{r, echo=FALSE}
+train_prob <- predict(rf_final, data = train_down)$predictions[, "1"]
+
+roc_train <- roc(train_down$death, train_prob, quiet = TRUE)
+
+best_thresh_youden <- coords(
+  roc_train,
+  x = "best",
+  best.method = "youden",
+  ret = "threshold"
+)[[1]]
+
+thresholds <- seq(0.01, 0.99, by = 0.01)
+
+f1_scores <- sapply(thresholds, function(thresh) {
+  pred_class <- factor(ifelse(train_prob > thresh, 1, 0), levels = c(0, 1))
+  cm <- confusionMatrix(pred_class, train_down$death, positive = "1")
+  as.numeric(cm$byClass["F1"])
+})
+
+best_f1_thresh <- thresholds[which.max(f1_scores)]
+
+best_thresh_youden <- as.numeric(best_thresh_youden)[1]
+
+kable(
+  data.frame(
+    Metodas = c("Youden indeksas", "F1 maksimumas"),
+    Slenkstis = c(best_thresh_youden, best_f1_thresh)
+  ),
+  digits = 3,
+  caption = "Optimalaus sprendimo slenksčio parinkimas"
+)
+```
+
+Optimizavome slenkstį pagal Youden indeksą, pasirinkome 0.54.
+
+Atsitiktinių miškų modelis pateikia ne binarinę prognozę („miręs“ / „gyvas“), bet mirties tikimybę nuo 0 iki 1.
+
+Norint šią tikimybę paversti klinikiniu sprendimu, būtina pasirinkti slenkstį, nuo kurio pacientas priskiriamas aukštos rizikos grupei.
+
+Slenkstis buvo optimizuotas dviem būdais:
+
+• Youden indeksu, kuris maksimalizuoja jautrumo ir specifiškumo sumą
+• F1 maksimumu, kuris subalansuoja jautrumą ir tikslumą
+
+Tai leidžia pritaikyti modelį praktiniam naudojimui, kai svarbu ne tik prognozės tikslumas, bet ir klaidingų sprendimų kaina.
+
+# Testavimo aibei įvertinimas
+```{r, echo=FALSE}
+test_prob <- predict(rf_final, data = test_data)$predictions[, "1"]
+
+best_thresh <- best_f1_thresh
+
+test_class <- factor(ifelse(test_prob > best_thresh, 1, 0), levels = c(0, 1))
+test_outcome <- factor(test_data$death, levels = c(0, 1))
+
+cm_test <- confusionMatrix(test_class, test_outcome, positive = "1")
+cm_test
+
+cm_df <- as.data.frame(cm_test$table)
+colnames(cm_df) <- c("Predicted", "Actual", "Count")
+
+cm_df$Actual <- factor(cm_df$Actual, levels = c(0, 1), labels = c("Gyvas", "Miręs"))
+cm_df$Predicted <- factor(cm_df$Predicted, levels = c(0, 1), labels = c("Gyvas", "Miręs"))
+
+ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Count)) +
+  geom_tile(color = "black") +
+  geom_text(aes(label = Count), color = "white", size = 6) +
+  scale_fill_gradient(low = "#D6EAF8", high = "#1B4F72") +
+  labs(
+    title = "Klasifikavimo matrica",
+    x = "Tikroji būklė",
+    y = "Prognozuota būklė",
+    fill = "Skaičius"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    legend.title = element_text(face = "bold")
+  )
+```
+
+Šioje matricoje galime matyti, kiek kartų suklydome arba kiek kartų modelis suklasifikavo teisingai. Žemiau yra pateikiamos metrikos, paskaičiuotos pagal šią matricą.
+```{r, echo=FALSE}
+metrics <- data.frame(
+  Rodiklis = c("Jautrumas", "Specifiškumas", "Tikslumas (Precision)", "F1", "Tikslumas (Accuracy)", "Kappa"),
+  Reikšmė = c(
+    cm_test$byClass["Sensitivity"],
+    cm_test$byClass["Specificity"],
+    cm_test$byClass["Precision"],
+    cm_test$byClass["F1"],
+    cm_test$overall["Accuracy"],
+    cm_test$overall["Kappa"]
+  )
+)
+
+kable(
+  metrics,
+  digits = 3,
+  caption = "Modelio veikimo rodikliai testavimo aibėje"
+)
+```
+
+Aiškinimas:
+
+	•	Jautrumas 0.748: modelis teisingai nustato apie 75 % tikrųjų mirusių pacientų. Tai laikoma gera reikšme, nes     praleidžiama tik 25% aukštos rizikos pacientų
+	
+	•	Specifiškumas 0.732: apie 73 % gyvų pacientų modelis teisingai priskiria kaip gyvus. Tai laikoma gera reikšme, nes tik 26% pacientų priskiriame į aukštos rizikos grupę, kai jie iš tikrųjų yra žemos (false alarm).
+	
+	•	Tikslumas (precision) 0.533: iš visų pacientų, kuriuos modelis prognozavo kaip mirusius, ~53 % iš tikrųjų mirė. Tai tikėtina ir normali situacija, nes:
+	•	mirtis yra reta baigtis,
+	•	modelis prioritetą teikia jautrumui.
+	
+	•	F1 rodiklis 0.622: harmoninis vidurkis tarp tikslumo ir jautrumo, atspindintis balansą tarp teisingų identifikacijų ir klaidingų prognozių. F1 rodiklis šiame kontekste laikytinas vidutiniškai geru. Kadangi mirtis yra santykinai reta baigtis, atsitiktinis arba naivus modelis (visus priskiriantis „gyvas“) turėtų labai žemą F1 (≈0). Todėl F1 = 0.62 rodo, kad modelis geba identifikuoti didelę dalį tikrųjų mirčių, išlaikant priimtiną klaidingų prognozių skaičių.
+	
+	•	Tikslumas (accuracy) 0.736: bendra modelio teisingumo dalis — apie 74 %. Tikslumas gali būti labai didelis net jei modelis turi labai prastą jautrumą arba specifiškumą, jei viena klasė dominuoja duomenyse. Bet šiuo atveju jis atspindi tiesą, nes mūsų jautrumas ir specifiškumas pakankamai subalansuotas (abu apytiksliai 0.74).
+	
+	•	Kappa 0.428: modelis gerokai viršija atsitiktinio spėjimo tikimybę. Dažna interpretacija:
+	•	0.21–0.40 → vidutinis
+	•	0.41–0.60 → geras
+	•	0.60 → labai geras
+
+Apibendrinus:
+
+	•	Modelis subalansuotas: tiek jautrumas, tiek specifiškumas yra vidutiniškai aukšti, todėl gali būti naudojamas ankstyvai rizikos identifikacijai.
+	
+	•	Žemas tikslumas (precision) yra normalus dėl mažesnio mirčių paplitimo testavimo aibėje; todėl dalis prognozių “miręs” yra klaidingos.
+	
+Žmogiškai: 
+
+  • Modelio kokybė kažkur tarp vidutinio ir gero modelio.
+
+# ROC ir AUC
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+roc_test <- roc(test_outcome, test_prob, quiet = TRUE)
+auc_test <- auc(roc_test)
+
+roc_df <- data.frame(
+  Sensitivity = rev(roc_test$sensitivities),
+  Specificity = rev(roc_test$specificities)
+)
+
+ggplot(roc_df, aes(x = 1 - Specificity, y = Sensitivity)) +
+  geom_line(color = "#2E86C1", size = 1.5) +         # ROC line
+  geom_abline(intercept = 0, slope = 1,               # diagonal line
+              linetype = "dashed", color = "gray70", size = 1) +
+  labs(
+    title = paste0("ROC kreivė (testavimo aibė)\nAUC = ", round(auc_test, 3)),
+    x = "1 - Specifiškumas",
+    y = "Jautrumas (Sensitivity)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+AUC 0.81 rodo, kad modelis patikimai atskiria aukštos rizikos pacientus nuo žemos rizikos pacientų.
+
+# Kintamųjų svarba
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+vi <- data.frame(
+  Kintamasis = names(rf_final$variable.importance),
+  Svarba = as.numeric(rf_final$variable.importance)
+) %>%
+  arrange(desc(Svarba)) %>%
+  slice(1:20)
+
+vi$Kintamasis <- fct_reorder(vi$Kintamasis, vi$Svarba)
+
+ggplot(vi, aes(x = Kintamasis, y = Svarba)) +
+  geom_col(fill = "#4F81BD") +
+  geom_text(aes(label = round(Svarba,1)), hjust = -0.1, size = 4) +
+  coord_flip() + 
+  labs(
+    title = "20 svarbiausių kintamųjų",
+    x = "",
+    y = "Kintamųjų svarbos vienetai"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    axis.text.y = element_text(size = 12),
+    axis.text.x = element_text(size = 12)
+  ) +
+  expand_limits(y = max(vi$Svarba) * 1.1)
+```
+
+Matome, kurie kintamieji modeliui buvo svarbiausi, kad klasifikuoti reikšmes. Amžius, hospitalizacijų skaičius, ligų skaičius ir, įdomiausia, demencija yra top 4. Šiek tiek galime tai paanalizuoti.
+
+Suskirstome pacientus į tuos kurie turi demenciją, ir tie kurie neturi. Nubraižome Kaplan-Meier grafiką.
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+df <- df %>%
+  mutate(death_FU_months = death_FU / 30.44)
+# Survival objektas: death_FU = laikas iki mirties / censoring, death = event
+surv_obj <- Surv(time = df$death_FU_months, event = df$death)
+
+# Kaplan-Meier modelis pagal demenciją
+km_fit <- survfit(surv_obj ~ Dementia, data = df)
+
+# Log-rank testas
+logrank_test <- survdiff(surv_obj ~ Dementia, data = df)
+p_val <- 1 - pchisq(logrank_test$chisq, length(logrank_test$n) - 1)
+p_val_text <- paste0("Log-rank p = ", signif(p_val, 3))
+
+# Grafinis atvaizdavimas be risk table
+ggsurvplot(
+  km_fit,
+  data = df,
+  risk.table = FALSE,      
+  pval = p_val_text,        
+  conf.int = TRUE,  
+  palette = c("#2E86C1", "#C0392B"), 
+  xlab = "Laikas (mėnesiais)", 
+  ylab = "Išlikimo tikimybė",
+  title = "Kaplan–Meier kreivė pagal demencijos statusą",
+  legend.title = "Demencija",
+  legend.labs = c("Ne", "Taip"),
+  ggtheme = theme_minimal(base_size = 14)
+)
+```
+
+Matome, kad log-rank testo p reikšmė < 0.00001, todėl skirtumas tarp grupių yra statistiškai reikšmingas.
+Pacientai, turintys demenciją, turi žymiai prastesnį išgyvenamumą nei pacientai be demencijos, kaip matyti iš Kaplan–Meier kreivės. Mūsų sukurtas modelis tam taip pat pritaria. Bet nors log-rank testas parodė statistiškai reikšmingą skirtumą (p < 0.00001), taip bus visuose grafikuose. Tai tikėtina dėl didelės imties apimties, kuri suteikia testui labai didelę statistinę galią. Todėl papildomai vertinsime efekto dydį. Pakolkas galime tik sutelkti dėmesį grafiškai, ir matome, kad demencijos kreivės tikrai turį nemažą skirtumą.
+
+# Kitų kintamųjų grafikai
+
+Kintamieji, kurie yra ne binariniai, buvo suskirstyti į grupes pagal medianas:
+
+• „Jaunesni“ – pacientai, kurių amžius ≤ imties medianos (75 metai)
+
+• „Vyresni“ – pacientai, kurių amžius > imties medianos (75 metai)
+
+• „Mažai ligų“ – pacientai, kurių gretutinių ligų skaičius ≤ medianos (4 ligos)
+
+• „Daug ligų“ – pacientai, kurių ligų skaičius > medianos (4 ligos)
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+dff <- Final %>%
+  mutate(Amzius_grupe = ifelse(
+    AMZIUS2016PR <= median(AMZIUS2016PR, na.rm = TRUE),
+    "Jaunesni",
+    "Vyresni"
+  ))
+
+dff <- dff %>%
+  mutate(death_FU_months = death_FU / 30.44)
+
+km_age <- survfit(surv_obj ~ Amzius_grupe, data = dff)
+
+ggsurvplot(
+  km_age,
+  data = dff,
+  conf.int = TRUE,
+  pval = TRUE,
+  risk.table = FALSE,
+  palette = c("#2E86C1", "#C0392B"),
+  title = "Kaplan–Meier kreivė pagal amžiaus grupę",
+  xlab = "Laikas (mėnesiais)",
+  ylab = "Išlikimo tikimybė",
+  legend.title = "Amžius",
+  legend.labs = c("Jaunesni", "Vyresni"),
+  ggtheme = theme_minimal(base_size = 14)
+)
+```
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+dff <- Final %>%
+  mutate(I50_in_grupe = ifelse(
+    inpatient_I50_count == 0,
+    "Nėra hospitalizacijų",
+    "≥1 hospitalizacija"
+  ))
+
+km_i50_in <- survfit(surv_obj ~ I50_in_grupe, data = dff)
+
+ggsurvplot(
+  km_i50_in,
+  data = dff,
+  conf.int = TRUE,
+  pval = TRUE,
+  risk.table = FALSE,
+  palette = c("#27AE60", "#C0392B"),
+  title = "Išgyvenamumas pagal hospitalizacijas dėl ŠN",
+  xlab = "Laikas (mėnesiais)",
+  ylab = "Išlikimo tikimybė",
+  legend.title = "Hospitalizacijos",
+  ggtheme = theme_minimal(base_size = 14)
+)
+```
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+dff <- Final %>%
+  mutate(Ligu_grupe = ifelse(
+    disease_count <= median(disease_count, na.rm = TRUE),
+    "Mazai ligų",
+    "Daug ligų"
+  ))
+
+km_disease <- survfit(surv_obj ~ Ligu_grupe, data = dff)
+
+ggsurvplot(
+  km_disease,
+  data = dff,
+  conf.int = TRUE,
+  pval = TRUE,
+  risk.table = FALSE,
+  palette = c("#1ABC9C", "#8E44AD"),
+  title = "Išgyvenamumas pagal gretutinių ligų skaičių",
+  xlab = "Laikas (mėnesiais)",
+  ylab = "Išlikimo tikimybė",
+  legend.title = "Ligų skaičius",
+  ggtheme = theme_minimal(base_size = 14)
+)
+```
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+dff <- Final %>%
+  mutate(I50_out_grupe = ifelse(
+    outpatient_I50_count == 0,
+    "Nėra konsultacijų",
+    "≥1 konsultacija"
+  ))
+
+km_i50_out <- survfit(surv_obj ~ I50_out_grupe, data = dff)
+
+ggsurvplot(
+  km_i50_out,
+  data = dff,
+  conf.int = TRUE,
+  pval = TRUE,
+  risk.table = FALSE,
+  palette = c("#2980B9", "#E67E22"),
+  title = "Išgyvenamumas pagal ambulatorines ŠN konsultacijas",
+  xlab = "Laikas (mėnesiais)",
+  ylab = "Išlikimo tikimybė",
+  legend.title = "Konsultacijos",
+  ggtheme = theme_minimal(base_size = 14)
+)
+```
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+km_copd <- survfit(surv_obj ~ COPD, data = Final)
+
+ggsurvplot(
+  km_copd,
+  data = Final,
+  conf.int = TRUE,
+  pval = TRUE,
+  risk.table = FALSE,
+  palette = c("#2ECC71", "#E74C3C"),
+  title = "Išgyvenamumas pagal LOPL (COPD)",
+  xlab = "Laikas (mėnesiais)",
+  ylab = "Išlikimo tikimybė",
+  legend.title = "LOPL",
+  legend.labs = c("Ne", "Taip"),
+  ggtheme = theme_minimal(base_size = 14)
+)
+```
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+km_dyslip <- survfit(surv_obj ~ Dyslipidemia, data = Final)
+
+ggsurvplot(
+  km_dyslip,
+  data = Final,
+  conf.int = TRUE,
+  pval = TRUE,
+  risk.table = FALSE,
+  palette = c("#3498DB", "#9B59B6"),
+  title = "Išgyvenamumas pagal dislipidemiją",
+  xlab = "Laikas (mėnesiais)",
+  ylab = "Išlikimo tikimybė",
+  legend.title = "Dislipidemija",
+
+  ggtheme = theme_minimal(base_size = 14)
+)
+```
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+vars <- c(
+  "Dementia",
+  "COPD",
+  "Dyslipidemia",
+  "disease_count",
+  "AMZIUS2016PR",
+  "inpatient_I50_count",
+  "outpatient_I50_count"
+)
+
+run_surv_stats <- function(var, data) {
+
+  if (!var %in% colnames(data)) return(NULL)
+
+  tmp <- data %>%
+    select(death_FU, death, all_of(var)) %>%
+    na.omit()
+
+  surv_obj <- Surv(tmp$death_FU, tmp$death)
+
+  # nustatom ar binarinis
+  is_binary <- length(unique(tmp[[var]])) == 2
+
+  # Cox modelis
+  cox <- coxph(surv_obj ~ tmp[[var]])
+  cox_sum <- summary(cox)
+
+  HR <- round(cox_sum$conf.int[1, "exp(coef)"], 2)
+  CI_low <- round(cox_sum$conf.int[1, "lower .95"], 2)
+  CI_high <- round(cox_sum$conf.int[1, "upper .95"], 2)
+  p_cox <- signif(cox_sum$coefficients[1, "Pr(>|z|)"], 3)
+
+  # Log-rank tik jei binarinis
+  if (is_binary) {
+    tmp[[var]] <- factor(tmp[[var]], levels = c(0, 1), labels = c("Ne", "Taip"))
+    lr <- survdiff(surv_obj ~ tmp[[var]])
+    p_lr <- signif(1 - pchisq(lr$chisq, df = 1), 3)
+  } else {
+    p_lr <- NA
+  }
+
+  data.frame(
+    Kintamasis = var,
+    Tipas = ifelse(is_binary, "Binarinis", "Skaitinis"),
+    HR = HR,
+    CI_apatinis = CI_low,
+    CI_virsutinis = CI_high,
+    p_Cox = p_cox,
+    p_LogRank = p_lr,
+    N = nrow(tmp)
+  )
+}
+surv_results <- bind_rows(
+  lapply(vars, run_surv_stats, data = Final)
+)
+
+kable(
+  surv_results,
+  caption = "Vienmatė išgyvenamumo analizė (Cox ir log-rank testai)"
+)
+```
+
+Interpretacija
+
+	1.	Dementia: HR = 3.51 – pacientai su demencija turi >3,5 karto didesnę mirties riziką. Skirtumas labai reikšmingas tiek Cox, tiek log-rank testais (p < 0.001).
+	
+	2.	COPD: HR = 2.07 – lėtinė obstrukcinė plaučių liga dvigubina riziką.
+	
+	3.	Dyslipidemia: HR = 0.38 – mažesnė rizika. (Tikrinta kelis sykius)
+	
+	4.	Skaitiniai kintamieji:
+	
+	•	disease_count: kiekviena papildoma liga padidina riziką ~9 %.
+	
+	•	AMZIUS2016PR: kiekvienas papildomas metai padidina riziką ~8 %.
+	
+	•	inpatient_I50_count: kiekviena hospitalizacija dėl širdies nepakankamumo ~1 % padidėjimas – mažas, bet reikšmingas.
+	
+	•	outpatient_I50_count: kiekviena ambulatorinė konsultacija dėl širdies nepakankamumo ~8 % padidėjimas.
